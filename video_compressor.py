@@ -74,6 +74,8 @@ class VideoCompressorApp(ctk.CTk):
         self._proc       = None
         self._start_time = 0
         self._duration   = 0
+        self.input_paths = []
+        self._cancelled  = False
 
         self._build_ui()
         self.after(500, self._check_dependencies)
@@ -116,7 +118,7 @@ class VideoCompressorApp(ctk.CTk):
         row.pack(fill="x", pady=(0, 6))
         self._input_entry = ctk.CTkEntry(
             row, textvariable=self.input_path,
-            placeholder_text="Select a video file…",
+            placeholder_text="Select one or multiple video files…",
             height=40, font=ctk.CTkFont("Courier", 12),
             fg_color="#2d2516", border_color="#8c6f2d"
         )
@@ -146,12 +148,12 @@ class VideoCompressorApp(ctk.CTk):
         )
         self._preset_menu.pack(fill="x", pady=(0, 12))
 
-        self._section(body, "💾  OUTPUT FILE")
+        self._section(body, "💾  OUTPUT DIRECTORY")
         out_row = ctk.CTkFrame(body, fg_color="transparent")
         out_row.pack(fill="x", pady=(0, 16))
         self._output_entry = ctk.CTkEntry(
             out_row, textvariable=self.output_path,
-            placeholder_text="Output path (auto-set when input is selected)…",
+            placeholder_text="Output directory (auto-set when input is selected)…",
             height=40, font=ctk.CTkFont("Courier", 12),
             fg_color="#2d2516", border_color="#8c6f2d"
         )
@@ -220,37 +222,54 @@ class VideoCompressorApp(ctk.CTk):
         ).pack(fill="x", pady=(8, 4))
 
     def _browse_input(self):
-        path = filedialog.askopenfilename(
-            title="Select Video",
+        paths = filedialog.askopenfilenames(
+            title="Select Videos",
             filetypes=[("Video files", "*.mp4 *.mov *.avi *.mkv *.webm *.flv *.wmv *.m4v *.ts"), ("All", "*.*")]
         )
-        if not path:
+        if not paths:
             return
-        self.input_path.set(path)
-        stem = Path(path).stem
-        out  = str(Path(path).parent / f"{stem}_compressed_fb.mp4")
-        self.output_path.set(out)
-        self._load_info(path)
+        self.input_paths = list(paths)
+        
+        base_dir = Path(self.input_paths[0]).parent
+        default_out_dir = base_dir / "Compressed_Videos"
+        
+        if len(self.input_paths) == 1:
+            self.input_path.set(self.input_paths[0])
+        else:
+            self.input_path.set(f"{len(self.input_paths)} files selected")
+            
+        self.output_path.set(str(default_out_dir))
+        self._load_info(self.input_paths)
 
     def _browse_output(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[("MP4", "*.mp4")]
-        )
+        path = filedialog.askdirectory(title="Select Output Directory")
         if path:
             self.output_path.set(path)
 
-    def _load_info(self, path):
-        info = get_video_info(path)
-        self._duration = info["duration"]
-        mins, secs = divmod(int(self._duration), 60)
-        txt = (
-            f"  📹 {info['width']}×{info['height']}  |  "
-            f"⏱ {mins}m {secs:02d}s  |  "
-            f"📦 {info['size_mb']:.1f} MB  |  "
-            f"🎞 {info['fps']} fps  |  "
-            f"🔤 {info['codec'].upper()}"
-        )
+    def _load_info(self, paths):
+        total_dur = 0
+        total_size = 0
+        for p in paths:
+            info = get_video_info(p)
+            total_dur += info.get("duration", 0)
+            total_size += info.get("size_mb", 0)
+
+        mins, secs = divmod(int(total_dur), 60)
+        if len(paths) == 1:
+            info = get_video_info(paths[0])
+            txt = (
+                f"  📹 {info['width']}×{info['height']}  |  "
+                f"⏱ {mins}m {secs:02d}s  |  "
+                f"📦 {info['size_mb']:.1f} MB  |  "
+                f"🎞 {info['fps']} fps  |  "
+                f"🔤 {info['codec'].upper()}"
+            )
+        else:
+            txt = (
+                f"  📁 {len(paths)} files selected  |  "
+                f"⏱ Total: {mins}m {secs:02d}s  |  "
+                f"📦 Total: {total_size:.1f} MB"
+            )
         self._info_label.configure(text=txt, text_color="#b0bec5")
 
     # ── Compression ────────────────────────────────────────────────────────────
@@ -279,48 +298,75 @@ class VideoCompressorApp(ctk.CTk):
         return cmd
 
     def _start_compression(self):
-        inp = self.input_path.get().strip()
-        out = self.output_path.get().strip()
-        if not inp or not os.path.isfile(inp):
-            messagebox.showerror("Error", "Please select a valid input video.")
+        if not hasattr(self, 'input_paths') or not self.input_paths:
+            messagebox.showerror("Error", "Please select at least one input video.")
             return
-        if not out:
-            messagebox.showerror("Error", "Please set an output path.")
+        out_dir = self.output_path.get().strip()
+        if not out_dir:
+            messagebox.showerror("Error", "Please set a valid output directory.")
             return
+            
+        if not os.path.exists(out_dir):
+            try:
+                os.makedirs(out_dir)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to create output directory: {e}")
+                return
 
         cfg = SIMPLE_PRESETS[self.preset_var.get()]
-        cmd = self._build_ffmpeg_cmd(inp, out, cfg)
 
         self._compress_btn.configure(state="disabled")
         self._cancel_btn.configure(state="normal")
         self._progress.set(0)
         self._start_time = time.time()
+        self._cancelled = False
 
-        threading.Thread(target=self._run_ffmpeg, args=(cmd, out), daemon=True).start()
+        threading.Thread(target=self._run_batch, args=(self.input_paths, out_dir, cfg), daemon=True).start()
 
-    def _run_ffmpeg(self, cmd, out):
-        self._set_status("🔄  Compressing…", "#4fc3f7")
-        try:
-            self._proc = subprocess.Popen(
-                cmd,
-                stderr=subprocess.PIPE,
-                universal_newlines=True,
-                encoding="utf-8",
-                errors="replace"
-            )
-            for line in self._proc.stderr:
-                self._parse_progress(line)
-            self._proc.wait()
-            if self._proc.returncode == 0:
-                self._on_done(out)
-            elif self._proc.returncode != -9:
-                self._set_status("❌  Compression failed.", "#ef5350")
-        except Exception as e:
-            self._set_status(f"❌  Error: {e}", "#ef5350")
-        finally:
-            self._reset_buttons()
+    def _run_batch(self, paths, out_dir, cfg):
+        total_files = len(paths)
+        completed_files = 0
+        
+        for i, inp in enumerate(paths):
+            if self._cancelled:
+                break
+                
+            stem = Path(inp).stem
+            out_name = f"{stem}_compressed_fb.mp4"
+            out = os.path.join(out_dir, out_name)
+            
+            cmd = self._build_ffmpeg_cmd(inp, out, cfg)
+            
+            self._set_status(f"🔄  Compressing {i+1}/{total_files}: {Path(inp).name}…", "#4fc3f7")
+            self._duration = get_video_info(inp).get("duration", 0)
+            
+            try:
+                self._proc = subprocess.Popen(
+                    cmd,
+                    stderr=subprocess.PIPE,
+                    universal_newlines=True,
+                    encoding="utf-8",
+                    errors="replace"
+                )
+                for line in self._proc.stderr:
+                    if self._cancelled:
+                        break
+                    self._parse_progress(line, offset=completed_files/total_files, scale=1.0/total_files)
+                self._proc.wait()
+                
+                if self._proc.returncode != 0 and self._proc.returncode != -9:
+                    self._set_status(f"❌  Compression failed for {Path(inp).name}.", "#ef5350")
+                    time.sleep(2)
+                    
+            except Exception as e:
+                self._set_status(f"❌  Error: {e}", "#ef5350")
+                time.sleep(2)
+                
+            completed_files += 1
 
-
+        self._reset_buttons()
+        if not self._cancelled:
+            self._on_done(out_dir, completed_files)
 
     def _parse_progress(self, line, offset=0.0, scale=1.0):
         # Parse ffmpeg's time= output
@@ -348,29 +394,29 @@ class VideoCompressorApp(ctk.CTk):
                 self._eta_label.configure(text=e),
             ))
 
-    def _on_done(self, out):
+    def _on_done(self, out_dir, completed_files):
         dur  = time.time() - self._start_time
         mins, secs = divmod(int(dur), 60)
-        size = os.path.getsize(out) / (1024*1024) if os.path.exists(out) else 0
         self.after(0, lambda: (
             self._progress.set(1.0),
             self._pct_label.configure(text="100%"),
             self._eta_label.configure(text="Done!"),
             self._set_status(
-                f"✅  Done in {mins}m {secs:02d}s  —  Output: {size:.1f} MB  →  {out}",
+                f"✅  Done in {mins}m {secs:02d}s  —  Processed {completed_files} file(s)",
                 "#66bb6a"
             )
         ))
         self.after(0, lambda: messagebox.showinfo(
             "✅ Compression Complete",
-            f"Video compressed successfully!\n\n"
-            f"⏱  Time taken : {mins}m {secs:02d}s\n"
-            f"📦  Output size: {size:.1f} MB\n"
-            f"📂  Saved to   : {out}"
+            f"Batch compression finished!\n\n"
+            f"⏱  Time taken: {mins}m {secs:02d}s\n"
+            f"📂  Saved to  : {out_dir}\n"
+            f"🎬  Files     : {completed_files}"
         ))
 
     def _cancel(self):
-        if self._proc:
+        self._cancelled = True
+        if getattr(self, '_proc', None):
             self._proc.kill()
         self._set_status("⛔  Cancelled.", "#ffa726")
         self._reset_buttons()
